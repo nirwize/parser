@@ -1,0 +1,108 @@
+{
+  "registered_from": "2025-01-01",
+  "registered_to": "2026-12-31",
+  "target": 50,
+  "max_pages_per_category": 3,
+  "max_ads_per_run": 300,
+  "delay_seconds": 4,
+  "timeout_seconds": 30,
+  "max_retries": 2,
+  "browser_channel": "auto",
+  "headless": false,
+  "categories": [
+    {
+      "name": "Электроника",
+      "url": "https://www.olx.pt/tecnologia-e-informatica/electronica/",
+      "enabled": true
+    },
+    {
+      "name": "Смартфоны",
+      "url": "https://www.olx.pt/telemoveis-e-tablets/telemoveis/",
+      "enabled": true
+    },
+    {
+      "name": "Ноутбуки и компьютеры",
+      "url": "https://www.olx.pt/tecnologia-e-informatica/computadores-informatica/",
+      "enabled": true
+    },
+    {
+      "name": "Игровые приставки",
+      "url": "https://www.olx.pt/tecnologia-e-informatica/videojogos-consolas/",
+      "enabled": true
+    },
+    {
+      "name": "Бытовая техника",
+      "url": "https://www.olx.pt/moveis-casa-e-jardim/electrodomesticos/",
+      "enabled": true
+    },
+    {
+      "name": "Мебель",
+      "url": "https://www.olx.pt/moveis-casa-e-jardim/moveis-decoracao/",
+      "enabled": true
+    },
+    {
+      "name": "Одежда и обувь",
+      "url": "https://www.olx.pt/moda/",
+      "enabled": true
+    },
+    {
+      "name": "Спортивные товары",
+      "url": "https://www.olx.pt/desporto-e-lazer/",
+      "enabled": true
+    },
+    {
+      "name": "Инструменты",
+      "url": "https://www.olx.pt/equipamentos-e-ferramentas/",
+      "enabled": true
+    },
+    {
+      "name": "Другие физические товары",
+      "url": "https://www.olx.pt/compra-venda/",
+      "enabled": true
+    }
+  ],
+  "blocked_category_terms": [
+    "imoveis",
+    "servicos",
+    "emprego",
+    "carros",
+    "motos",
+    "motociclos",
+    "barcos",
+    "veiculos",
+    "autocaravanas",
+    "caravanas",
+    "bicicletas",
+    "trotinetes",
+    "animais",
+    "bilhetes",
+    "software",
+    "contas-digitais"
+  ],
+  "excluded_offer_patterns": [
+    "\\b(arrenda(?:mento|r|se)?|aluguer|aluga(?:se|r)?|trespasse)\\b",
+    "\\b(presto|prestamos|ofereco|oferecemos)\\s+servicos\\b",
+    "\\b(reparacao|reparacoes|instalacao|instalacoes|assistencia tecnica|explicacoes|aulas particulares)\\b",
+    "\\b(procura-se|procuramos|recrutamento|vaga de emprego|oferta de emprego)\\b",
+    "\\b(conta (?:digital|steam|psn|netflix)|licenca digital|codigo digital|jogo digital|ebook|e-book|subscricao|assinatura digital)\\b",
+    "\\b(criacao de sites|desenvolvimento de sites|site com sistema|loja online pronta)\\b",
+    "\\b(apartamento|moradia|terreno|quarto para arrendar|automovel|motociclo|autocaravana|caravana|trotinete|bicicleta|scooter|efoil)\\b",
+    "\\b(financiamento|franchising|oportunidade de negocio|negocio completo)\\b"
+  ],
+  "business_patterns": [
+    "\\b(somos (?:uma )?(?:loja|empresa)|nossa loja|nossa empresa|loja fisica|visite a loja)\\b",
+    "\\b(vendedor profissional|vendedores profissionais|revendedor autorizado|em stock|temos stock|varias unidades disponiveis)\\b",
+    "\\b(unipessoal|sociedade por quotas|lda)\\b"
+  ],
+  "selectors": {
+    "listing_links": "a[href*='/d/anuncio/']",
+    "next_link": "a[rel='next'], a[aria-label='Seguinte']",
+    "title": "[data-testid='offer_title'], [data-cy='offer_title'], [data-cy='ad_title'], [data-testid='ad-title'], h1",
+    "price": "[data-testid='ad-price-container'], [data-cy='ad_price'], [itemprop='price']",
+    "parameters": "[data-testid='ad-parameters-container'], [data-testid='ad-parameters'], [data-cy='ad-parameters']",
+    "description": "[data-testid='ad_description'], [data-cy='ad_description'], [data-testid='ad-description']",
+    "seller": "[data-testid='seller_card'], [data-cy='seller_card'], [data-testid='member-since'], [data-cy='member-since'], [data-testid='user-profile'], [data-testid='user-profile-card'], [data-cy='seller_profile']",
+    "contact": "[data-testid='phones-container'], [data-cy='phones-container'], [data-testid='ad-contact-bar'], [data-cy='ad-contact-bar'], [data-testid='ad-contact'], [data-testid='contact-box']",
+    "breadcrumbs": "[data-testid='breadcrumbs'] a, nav[aria-label*='breadcrumb' i] a, [itemtype$='BreadcrumbList'] a"
+  }
+}
