@@ -138,7 +138,7 @@ CLI может сохранить новый JSONL-файл через `--output
 - `max_ads_per_run`, `max_pages_per_category`: ограничение объёма проверки.
 - `delay_seconds`: пауза между переходами, минимум 2 секунды.
 - `timeout_seconds`, `max_retries`: таймаут и ограниченные повторы.
-- `browser_channel`: `auto`, `chrome`, `msedge` или `chromium`.
+- `browser_channel`: `auto` выбирает семейство браузера, назначенного в Windows для HTTPS; `chrome`, `msedge` или `chromium` задают браузер явно. Для Firefox используется совместимая сборка Playwright (`python -m playwright install firefox`), а не обычный профиль Firefox.
 - `headless`: показывать или скрывать окно браузера.
 - `blocked_category_terms`: исключённые ветки категорий.
 - `excluded_offer_patterns`, `business_patterns`: регулярные выражения для

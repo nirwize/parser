@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import threading
 import time
 from collections import Counter
@@ -37,6 +38,38 @@ class AccessBlocked(ScanError):
     pass
 
 
+class NavigationError(ScanError):
+    pass
+
+
+class ReadError(ScanError):
+    pass
+
+
+def read_error_kind(exc: Exception) -> str:
+    """Classify browser failures without logging page contents or contact data."""
+    message = str(exc).casefold()
+    if any(term in message for term in ("execution context was destroyed", "cannot find context",
+                                        "context was destroyed", "frame was detached", "navigation")):
+        return "page_changed"
+    if any(term in message for term in ("target closed", "page closed", "browser has been closed")):
+        return "page_closed"
+    if any(term in message for term in ("syntaxerror", "typeerror", "referenceerror", "invalid regular expression")):
+        return "extract_script"
+    if "not a valid selector" in message or "failed to execute 'queryselectorall'" in message:
+        return "invalid_selector"
+    return "browser_read"
+
+
+READ_ERROR_MESSAGES = {
+    "page_changed": "Страница обновлялась во время чтения полей.",
+    "page_closed": "Вкладка закрылась во время чтения полей.",
+    "extract_script": "Ошибка скрипта извлечения полей.",
+    "invalid_selector": "Некорректный CSS-селектор в config.json.",
+    "browser_read": "Ошибка браузера при чтении полей.",
+}
+
+
 @dataclass
 class Summary:
     checked: int = 0
@@ -61,83 +94,134 @@ def retry_after_seconds(value: str | None, now: datetime | None = None) -> float
         return None
 
 
+def default_browser_executable() -> str | None:
+    """Ask Windows which executable handles HTTPS for the current user."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    query = ctypes.windll.shlwapi.AssocQueryStringW
+    query.argtypes = (wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR,
+                      wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    query.restype = ctypes.c_long
+    size = wintypes.DWORD(0)
+    query(0, 2, "https", None, None, ctypes.byref(size))  # ASSOCSTR_EXECUTABLE
+    if not size.value:
+        return None
+    buffer = ctypes.create_unicode_buffer(size.value)
+    if query(0, 2, "https", None, buffer, ctypes.byref(size)) != 0:
+        return None
+    return buffer.value or None
+
+
 def launch_browser(playwright, config: Config):
-    channels = ("chrome", "msedge", "chromium") if config.browser_channel == "auto" else (config.browser_channel,)
-    for channel in channels:
-        try:
-            options = {"headless": config.headless}
-            if channel != "chromium":
-                options["channel"] = channel
-            # No stealth arguments, proxy rotation or access-control workarounds.
-            return playwright.chromium.launch(**options)
-        except Exception:
-            continue
-    raise ScanError("Браузер не запустился. Установите Chrome/Edge или выполните python -m playwright install chromium.")
+    options = {"headless": config.headless}
+    browser_type = playwright.chromium
+    if config.browser_channel == "auto":
+        executable = default_browser_executable()
+        if not executable:
+            raise ScanError("Не удалось определить браузер Windows по умолчанию для HTTPS.")
+        name = Path(executable).name.casefold()
+        if name == "chrome.exe":
+            options["channel"] = "chrome"
+        elif name == "msedge.exe":
+            options["channel"] = "msedge"
+        elif name == "firefox.exe":
+            browser_type = playwright.firefox
+            # Stock Firefox lacks Playwright's automation transport.
+            # Use the Playwright Firefox build for the selected browser family.
+        elif name in {"brave.exe", "vivaldi.exe", "opera.exe", "chromium.exe"}:
+            options["executable_path"] = executable
+        else:
+            raise ScanError(f"Браузер Windows по умолчанию ({name}) не поддерживается Playwright.")
+    elif config.browser_channel != "chromium":
+        options["channel"] = config.browser_channel
+    try:
+        # No stealth arguments, proxy rotation or access-control workarounds.
+        return browser_type.launch(**options)
+    except Exception:
+        if browser_type is playwright.firefox:
+            raise ScanError("Firefox Playwright не запустился. Выполните: python -m playwright install firefox") from None
+        raise ScanError("Браузер по умолчанию не запустился через Playwright. Проверьте его установку или выберите browser_channel в config.json.") from None
 
 
 class Scanner:
     def __init__(self, config: Config, stop: threading.Event | None = None,
-                 log=None, on_result=None, on_progress=None):
+                 log=None, on_result=None, on_progress=None,
+                 login_ready: threading.Event | None = None, on_login_required=None):
         self.config = config
         self.stop = stop if stop is not None else threading.Event()
         self.log = log or (lambda message: None)
         self.on_result = on_result or (lambda result: None)
         self.on_progress = on_progress or (lambda checked, accepted: None)
+        self.login_ready = login_ready
+        self.on_login_required = on_login_required or (lambda: None)
         self._last_navigation = 0.0
 
     def pause(self, seconds: float = 0) -> None:
         if self.stop.wait(max(0, seconds)):
             raise Stopped("Сбор остановлен пользователем.")
 
-    def navigate(self, page, url: str) -> bool:
-        """Return false only for removed pages. Retry transient failures with a bound."""
+    def navigate(self, page, url: str, fresh_on_retry: bool = False):
+        """Return the loaded page, or None for a removed advert."""
         safe = olx_url(url)
         if not safe:
-            raise ScanError("Переход вне публичных страниц OLX.pt запрещён.")
-        from playwright.sync_api import Error as PlaywrightError
-        for attempt in range(self.config.max_retries + 1):
-            self.pause(self.config.delay_seconds - (time.monotonic() - self._last_navigation))
-            self._last_navigation = time.monotonic()
-            try:
-                response = page.goto(safe, wait_until="domcontentloaded",
-                                     timeout=self.config.timeout_seconds * 1000)
-            except PlaywrightError:
-                self.pause()
-                if page.is_closed():
-                    raise ScanError("Окно браузера было закрыто.") from None
-                if attempt == self.config.max_retries:
-                    raise ScanError("Страница не загрузилась после ограниченного числа повторов.") from None
-                self.log("Ошибка соединения; выполняется повтор с задержкой.")
-                self.pause(5 * (2 ** attempt))
-                continue
-            if not olx_url(page.url):
-                raise AccessBlocked("Сайт перенаправил на вход или другой домен. Сбор остановлен.")
-            if response is None:
-                raise ScanError("Не получен ответ страницы.")
-            status = response.status
-            if status in {401, 403}:
-                raise AccessBlocked(f"OLX вернул HTTP {status}. Сбор остановлен без обхода ограничений.")
-            if status in {404, 410}:
-                return False
-            if status == 429:
-                wait = retry_after_seconds(response.header_value("retry-after"))
-                wait = max(wait if wait is not None else 15 * (2 ** attempt), self.config.delay_seconds)
-                if attempt == self.config.max_retries or wait > 120:
-                    raise AccessBlocked("OLX ограничил частоту запросов (429). Повторите запуск позже.")
-                self.log(f"Ограничение частоты запросов; пауза {wait:.0f} с.")
-                self.pause(wait)
-                continue
-            if status >= 500:
-                if attempt == self.config.max_retries:
-                    raise ScanError("Сервер OLX временно недоступен.")
-                self.log("Временная ошибка OLX; повтор с задержкой.")
-                self.pause(5 * (2 ** attempt))
-                continue
-            if status >= 400:
-                raise ScanError(f"Не удалось открыть страницу: HTTP {status}.")
-            self.check_access(page)
-            return True
-        raise ScanError("Не удалось загрузить страницу.")
+            raise NavigationError("Переход вне публичных страниц OLX.pt запрещён.")
+        from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeout
+        initial_page = page
+        try:
+            for attempt in range(self.config.max_retries + 1):
+                self.pause(self.config.delay_seconds - (time.monotonic() - self._last_navigation))
+                self._last_navigation = time.monotonic()
+                try:
+                    # Response headers are enough here; the DOM is awaited separately.
+                    response = page.goto(safe, wait_until="commit",
+                                         timeout=self.config.timeout_seconds * 1000)
+                except PlaywrightError as exc:
+                    self.pause()
+                    if page.is_closed():
+                        raise NavigationError("Вкладка закрылась во время перехода.") from None
+                    kind = "таймаут" if isinstance(exc, PlaywrightTimeout) else "сбой соединения"
+                    if attempt == self.config.max_retries:
+                        raise NavigationError(f"Не удалось открыть карточку: {kind} после повторов.") from None
+                    self.log(f"Переход: {kind}; повтор после паузы.")
+                    self.pause(5 * (2 ** attempt))
+                else:
+                    if not olx_url(page.url):
+                        raise AccessBlocked("Сайт перенаправил на вход или другой домен. Сбор остановлен.")
+                    if response is None:
+                        raise NavigationError("Сайт не вернул ответ страницы.")
+                    status = response.status
+                    if status in {401, 403}:
+                        raise AccessBlocked(f"OLX вернул HTTP {status}. Сбор остановлен без обхода ограничений.")
+                    if status in {404, 410}:
+                        return None
+                    if status == 429:
+                        wait = retry_after_seconds(response.header_value("retry-after"))
+                        wait = max(wait if wait is not None else 15 * (2 ** attempt), self.config.delay_seconds)
+                        if attempt == self.config.max_retries or wait > 120:
+                            raise AccessBlocked("OLX ограничил частоту запросов (429). Повторите запуск позже.")
+                        self.log(f"Ограничение частоты запросов; пауза {wait:.0f} с.")
+                        self.pause(wait)
+                    elif status >= 500:
+                        if attempt == self.config.max_retries:
+                            raise NavigationError(f"Сервер OLX вернул HTTP {status} после повторов.")
+                        self.log(f"Сервер OLX вернул HTTP {status}; повтор после паузы.")
+                        self.pause(5 * (2 ** attempt))
+                    elif status >= 400:
+                        raise NavigationError(f"Сайт вернул HTTP {status}.")
+                    else:
+                        return page
+                if fresh_on_retry:
+                    replacement = page.context.new_page()
+                    page.close()
+                    page = replacement
+            raise NavigationError("Не удалось открыть страницу после повторов.")
+        except Exception:
+            if page is not initial_page and not page.is_closed():
+                page.close()
+            raise
 
     def check_access(self, page):
         path = urlsplit(page.url).path.casefold()
@@ -152,14 +236,21 @@ class Scanner:
         deadline = time.monotonic() + self.config.timeout_seconds
         while time.monotonic() < deadline:
             self.pause()
-            self.check_access(page)
             try:
-                if page.locator(selector).first.is_visible():
+                self.check_access(page)
+                if page.locator(selector).evaluate_all(
+                    "nodes => nodes.some(node => node.getClientRects().length > 0)"
+                ):
                     return True
             except PlaywrightError:
-                raise ScanError("Не удалось прочитать элемент страницы. Проверьте селекторы в config.json.") from None
-            if page.get_by_text(re.compile(r"não encontrámos|nenhum anúncio", re.I)).count():
-                return False
+                if page.is_closed():
+                    raise ReadError("Вкладка закрылась при ожидании разметки.") from None
+                # A newly committed document may replace its execution context.
+            try:
+                if page.get_by_text(re.compile(r"não encontrámos|nenhum anúncio", re.I)).count():
+                    return False
+            except PlaywrightError:
+                pass
             self.pause(0.5)
         return False
 
@@ -170,6 +261,82 @@ class Scanner:
             "offerPatterns": list(self.config.excluded_offer_patterns),
             "businessPatterns": list(self.config.business_patterns),
         })
+
+    def reveal_phone(self, page) -> bool:
+        """Use only the site's visible reveal button; never return the number."""
+        from playwright.sync_api import Error as PlaywrightError
+        label = re.compile(r"(?:mostrar|ver|exibir)\s+(?:o\s+)?(?:n[úu]mero|telefone|contacto)", re.I)
+        for selector in (self.config.selectors["contact"], self.config.selectors["seller"]):
+            try:
+                for scope in page.locator(selector).all():
+                    button = scope.get_by_role("button", name=label).first
+                    if button.count() and button.is_visible() and button.is_enabled():
+                        button.click(timeout=min(5000, self.config.timeout_seconds * 1000))
+                        return True
+            except PlaywrightError as exc:
+                kind = read_error_kind(exc)
+                if kind == "page_changed":
+                    return True  # The click may have navigated; re-check the page without assuming a phone.
+                raise ReadError(READ_ERROR_MESSAGES[kind]) from None
+        return False
+
+    def wait_for_revealed_phone(self, page) -> bool:
+        """Re-read only a boolean phone signal after a user-visible click."""
+        from playwright.sync_api import Error as PlaywrightError
+        deadline = time.monotonic() + min(5, self.config.timeout_seconds)
+        while True:
+            self.pause()
+            try:
+                self.check_access(page)
+                evidence = self.extract(page)
+                if evidence.get("phone_confirmed") is True:
+                    return True
+            except PlaywrightError as exc:
+                if read_error_kind(exc) not in {"page_changed", "browser_read"}:
+                    raise ReadError(READ_ERROR_MESSAGES[read_error_kind(exc)]) from None
+            if time.monotonic() >= deadline:
+                return False
+            self.pause(0.5)
+
+    def evaluate_detail(self, page, evidence: dict, url: str, category: Category):
+        if evidence.get("phone_confirmed") is not True:
+            candidate, _ = evaluate({**evidence, "phone_confirmed": True},
+                                    url, category, self.config)
+            if candidate and self.reveal_phone(page):
+                evidence["phone_confirmed"] = self.wait_for_revealed_phone(page)
+        return evaluate(evidence, url, category, self.config)
+
+    def wait_for_detail_fields(self, page) -> dict:
+        """Wait for asynchronous card fields, without waiting for a phone reveal."""
+        from playwright.sync_api import Error as PlaywrightError
+        deadline = time.monotonic() + self.config.timeout_seconds
+        latest = None
+        last_error = None
+        while True:
+            self.pause()
+            try:
+                self.check_access(page)
+                latest = self.extract(page)
+                last_error = None
+                ready = (latest.get("title") and latest.get("price")
+                         and latest.get("registration_labels") and latest.get("category_urls")
+                         and latest.get("description_checked"))
+                if self.config.seller_mode == "private":
+                    ready = ready and latest.get("seller_types")
+                if ready:
+                    return latest
+            except PlaywrightError as exc:
+                if page.is_closed():
+                    raise ReadError("Вкладка закрылась при чтении карточки.") from None
+                last_error = read_error_kind(exc)
+                if last_error in {"extract_script", "invalid_selector"}:
+                    raise ReadError(READ_ERROR_MESSAGES[last_error]) from None
+                # Hydration can replace the document while fields are being read.
+            if time.monotonic() >= deadline:
+                if latest is not None:
+                    return latest  # Missing fields will be rejected by evaluate().
+                raise ReadError(READ_ERROR_MESSAGES.get(last_error, "Не удалось прочитать поля карточки после ожидания."))
+            self.pause(0.5)
 
     def links(self, page) -> list[str]:
         raw = page.locator(self.config.selectors["listing_links"]).evaluate_all(
@@ -211,7 +378,15 @@ class Scanner:
                     context = browser.new_context(locale="pt-PT", viewport={"width": 1400, "height": 900})
                     context.set_default_timeout(self.config.timeout_seconds * 1000)
                     listing_page = context.new_page()
-                    detail_page = context.new_page()
+                    if self.login_ready is not None:
+                        if self.config.headless:
+                            raise ScanError("Для ручного входа нужен видимый браузер.")
+                        listing_page = self.navigate(listing_page, "https://www.olx.pt/")
+                        self.log("Войдите в OLX вручную в открытом браузере, затем нажмите «Я вошёл — продолжить» в приложении.")
+                        self.on_login_required()
+                        while not self.login_ready.wait(0.2):
+                            self.pause()
+                        self.check_access(listing_page)
                     seen_ads = set()
                     for category in self.config.categories:
                         if not category.enabled:
@@ -226,9 +401,11 @@ class Scanner:
                             if not next_url or next_url in seen_pages:
                                 break
                             seen_pages.add(next_url)
-                            if not self.navigate(listing_page, next_url):
+                            loaded_listing = self.navigate(listing_page, next_url, fresh_on_retry=True)
+                            if loaded_listing is None:
                                 self.log("Категория недоступна; проверьте её URL в config.json.")
                                 break
+                            listing_page = loaded_listing
                             summary.pages += 1
                             if not self.wait_for_content(listing_page, self.config.selectors["listing_links"]):
                                 self.log("Ссылки на объявления не найдены: пустая выдача или изменившаяся разметка.")
@@ -247,38 +424,46 @@ class Scanner:
                                 seen_ads.add(key)
                                 summary.checked += 1
                                 result = None
-                                reason = "page_error"
+                                reason = "read_error"
+                                detail_page = context.new_page()
                                 try:
-                                    if not self.navigate(detail_page, url):
+                                    loaded_detail = self.navigate(detail_page, url, fresh_on_retry=True)
+                                    if loaded_detail is None:
                                         reason = "unavailable"
-                                    elif not self.wait_for_content(detail_page, self.config.selectors["title"]):
-                                        reason = "title"
                                     else:
-                                        # Allow the visible seller/contact fields to hydrate. Not a network-idle wait.
-                                        self.pause(1)
-                                        self.check_access(detail_page)
-                                        evidence = self.extract(detail_page)
+                                        detail_page = loaded_detail
+                                    if loaded_detail is not None and not self.wait_for_content(detail_page, self.config.selectors["title"]):
+                                        reason = "title"
+                                    elif loaded_detail is not None:
+                                        evidence = self.wait_for_detail_fields(detail_page)
                                         if canonical_ad_url(detail_page.url) != url:
                                             reason = "url"
                                         else:
-                                            result, reason = evaluate(evidence, url, category, self.config)
+                                            result, reason = self.evaluate_detail(detail_page, evidence, url, category)
                                         del evidence
                                 except (AccessBlocked, Stopped):
                                     raise
+                                except NavigationError as exc:
+                                    reason = "navigation_error"
+                                    self.log(str(exc))
+                                except ReadError as exc:
+                                    reason = "read_error"
+                                    self.log(str(exc))
                                 except ScanError as exc:
                                     self.log(str(exc))
-                                    if detail_page.is_closed():
-                                        raise
-                                except PlaywrightError:
-                                    if detail_page.is_closed():
-                                        raise ScanError("Окно браузера было закрыто.") from None
-                                    self.log("Не удалось прочитать карточку; возможное изменение разметки.")
+                                except PlaywrightError as exc:
+                                    reason = "read_error"
+                                    self.log(READ_ERROR_MESSAGES[read_error_kind(exc)])
+                                finally:
+                                    if not detail_page.is_closed():
+                                        detail_page.close()
                                 summary.reasons[reason] += 1
                                 if result:
                                     summary.accepted += 1
                                     self.on_result(result)
+                                    self.log(f"Объявление #{summary.checked} ({key}): подходит.")
                                 else:
-                                    self.log(f"Пропуск: {REASONS[reason]}.")
+                                    self.log(f"Объявление #{summary.checked} ({key}): пропуск — {REASONS[reason]}.")
                                 self.on_progress(summary.checked, summary.accepted)
                             if summary.accepted >= self.config.target or summary.checked >= self.config.max_ads_per_run:
                                 break

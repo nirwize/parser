@@ -15,7 +15,8 @@
     }
     return null;
   };
-  const text = element => element ? element.innerText.trim() : '';
+  const text = element => element && typeof element.innerText === 'string'
+    ? element.innerText.trim() : '';
   const norm = value => value.toLocaleLowerCase('pt-PT').normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '');
   const title = text(first(selectors.title));

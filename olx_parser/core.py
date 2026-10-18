@@ -5,7 +5,7 @@ import json
 import math
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -24,6 +24,8 @@ ALLOWED_ROOTS = {
     "moda", "desporto-e-lazer", "equipamentos-e-ferramentas", "compra-venda",
     "bebe-e-crianca", "lazer",
 }
+ALL_CATEGORIES = "Все категории"
+SELLER_CHOICES = {"Только частные": "private", "Все продавцы": "all"}
 CONTACT_RE = re.compile(
     r"(?<!\w)(?:\+?351[\s().-]*)?[29](?:[\s().-]*\d){8}(?!\d)|"
     r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I
@@ -132,6 +134,7 @@ class Config:
     excluded_offer_patterns: tuple[str, ...]
     business_patterns: tuple[str, ...]
     selectors: dict[str, str]
+    seller_mode: str = "private"
 
     @classmethod
     def load(cls, path: Path = ROOT / "config.json") -> Config:
@@ -171,6 +174,12 @@ class Config:
                 categories.append(Category(item["name"].strip(), url, item["enabled"]))
             if not any(item.enabled for item in categories):
                 raise ValueError("Включите хотя бы одну категорию.")
+            enabled_names = [item.name for item in categories if item.enabled]
+            if len(enabled_names) != len(set(enabled_names)):
+                raise ValueError("Названия включённых категорий должны быть уникальными.")
+            seller_mode = raw.get("seller_mode", "private")
+            if seller_mode not in {"private", "all"}:
+                raise ValueError("seller_mode: допустимо private или all.")
             lists = {}
             for key in ("blocked_category_terms", "excluded_offer_patterns", "business_patterns"):
                 values = raw[key]
@@ -189,9 +198,36 @@ class Config:
                        integer("max_ads_per_run", 1, 100000),
                        seconds("delay_seconds", 2, 3600), seconds("timeout_seconds", 5, 120),
                        integer("max_retries", 0, 5), channel, raw["headless"], tuple(categories),
-                       selectors=dict(selectors), **lists)
+                       selectors=dict(selectors), seller_mode=seller_mode, **lists)
         except (OSError, json.JSONDecodeError, KeyError, TypeError, AttributeError, re.error) as exc:
             raise ValueError("Не удалось прочитать config.json: проверьте поля и формат файла.") from exc
+
+
+def apply_search_filters(config: Config, registered_from: str, registered_to: str,
+                         category_name: str, seller_choice: str) -> Config:
+    """Validate the three GUI rows and build settings for this run only."""
+    dates = []
+    for label, value in (("Начало периода", registered_from), ("Конец периода", registered_to)):
+        value = value.strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            raise ValueError(f"{label}: укажите дату в формате ГГГГ-ММ-ДД.")
+        try:
+            dates.append(date.fromisoformat(value))
+        except ValueError:
+            raise ValueError(f"{label}: такой даты не существует.") from None
+    if dates[0] > dates[1]:
+        raise ValueError("Начало периода регистрации позже конца.")
+    enabled = tuple(item for item in config.categories if item.enabled)
+    if category_name == ALL_CATEGORIES:
+        selected = enabled
+    else:
+        selected = tuple(item for item in enabled if item.name == category_name)
+    if not selected:
+        raise ValueError("Выберите категорию из включённых в config.json.")
+    if seller_choice not in SELLER_CHOICES:
+        raise ValueError("Выберите тип продавца из списка.")
+    return replace(config, registered_from=dates[0], registered_to=dates[1],
+                   categories=selected, seller_mode=SELLER_CHOICES[seller_choice])
 
 
 @dataclass(frozen=True)
@@ -216,7 +252,8 @@ REASONS = {
     "category": "категория не подтверждена или исключена",
     "offer": "не подтверждена продажа физического товара",
     "unavailable": "объявление недоступно",
-    "page_error": "ошибка загрузки страницы",
+    "navigation_error": "сбой перехода к объявлению",
+    "read_error": "сбой чтения полей объявления",
 }
 
 
@@ -232,11 +269,12 @@ def evaluate(evidence: dict, url: str, category: Category, config: Config,
     price = euro_price(evidence.get("price", ""))
     if price is None:
         return None, "price"
-    types = {normalized(x.strip()) for x in evidence.get("seller_types", [])}
-    if evidence.get("business_signal") is not False or types & {"profissional", "empresa", "negocio"}:
-        return None, "business"
-    if types != {"particular"}:
-        return None, "private"
+    if config.seller_mode == "private":
+        types = {normalized(x.strip()) for x in evidence.get("seller_types", [])}
+        if evidence.get("business_signal") is not False or types & {"profissional", "empresa", "negocio"}:
+            return None, "business"
+        if types != {"particular"}:
+            return None, "private"
     intervals = {registration_interval(text) for text in evidence.get("registration_labels", [])}
     if not intervals or None in intervals or len(intervals) != 1:
         return None, "registration_unknown"

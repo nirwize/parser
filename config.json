@@ -1,6 +1,7 @@
 {
   "registered_from": "2025-01-01",
   "registered_to": "2026-12-31",
+  "seller_mode": "private",
   "target": 50,
   "max_pages_per_category": 3,
   "max_ads_per_run": 300,

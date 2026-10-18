@@ -9,7 +9,8 @@ from pathlib import Path
 
 from olx_parser.browser import Scanner, Stopped, retry_after_seconds
 from olx_parser.core import (
-    ROOT, Config, canonical_ad_url, euro_price, evaluate, olx_url, registration_interval,
+    ALL_CATEGORIES, ROOT, Config, apply_search_filters, canonical_ad_url,
+    euro_price, evaluate, olx_url, registration_interval,
 )
 
 
@@ -50,6 +51,52 @@ class RulesTests(unittest.TestCase):
         for value in (["Particular", "Profissional"], ["Empresa"], ["Particular", "unknown"]):
             self.assertIsNone(self.check(seller_types=value)[0])
         self.assertEqual(self.check(business_signal=True)[1], "business")
+
+    def test_all_sellers_includes_private_and_business_without_changing_other_rules(self):
+        config = apply_search_filters(self.config, "2025-01-01", "2026-12-31",
+                                      ALL_CATEGORIES, "Все продавцы")
+        self.assertEqual(config.seller_mode, "all")
+        self.assertEqual(len(config.categories), sum(item.enabled for item in self.config.categories))
+        for types, business in ((["Particular"], False), (["Profissional"], True),
+                                (["Empresa"], True), ([], False)):
+            with self.subTest(types=types):
+                evidence = self.evidence | {"seller_types": types, "business_signal": business}
+                item, reason = evaluate(evidence, self.url, self.category, config, date(2026, 10, 18))
+                self.assertEqual(reason, "accepted")
+                self.assertIsNotNone(item)
+        self.assertEqual(evaluate(self.evidence | {"phone_confirmed": False},
+                                  self.url, self.category, config)[1], "phone_unknown")
+        self.assertEqual(evaluate(self.evidence | {"excluded_offer": True},
+                                  self.url, self.category, config)[1], "offer")
+
+    def test_ui_period_and_category_limit_results(self):
+        chosen = self.config.categories[1]
+        config = apply_search_filters(self.config, "2025-04-01", "2025-12-31",
+                                      chosen.name, "Только частные")
+        self.assertEqual((config.registered_from, config.registered_to),
+                         (date(2025, 4, 1), date(2025, 12, 31)))
+        self.assertEqual(config.categories, (chosen,))
+        self.assertEqual(config.seller_mode, "private")
+        evidence = self.evidence | {
+            "registration_labels": ["No OLX desde maio de 2025"],
+            "category_urls": [chosen.url],
+        }
+        self.assertEqual(evaluate(evidence, self.url, chosen, config)[1], "accepted")
+        self.assertEqual(evaluate(self.evidence, self.url, chosen, config)[1], "registration_range")
+
+    def test_ui_invalid_dates_category_and_seller(self):
+        valid = ("2025-01-01", "2026-12-31", ALL_CATEGORIES, "Только частные")
+        for values in (("", *valid[1:]), ("2025-02-30", *valid[1:]),
+                       ("2025/01/01", *valid[1:]), ("2027-01-01", "2026-12-31", *valid[2:]),
+                       (valid[0], "", *valid[2:]), (valid[0], "2026-13-01", *valid[2:]),
+                       (*valid[:2], "Несуществующая категория", valid[3]),
+                       (*valid[:3], "Магазины")):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    apply_search_filters(self.config, *values)
+        disabled = replace(self.config, categories=(replace(self.category, enabled=False), *self.config.categories[1:]))
+        with self.assertRaises(ValueError):
+            apply_search_filters(disabled, valid[0], valid[1], self.category.name, valid[3])
 
     def test_registration_bounds(self):
         for label in ("dezembro de 2024", "janeiro de 2027"):

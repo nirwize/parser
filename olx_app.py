@@ -11,11 +11,12 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from olx_parser.browser import Scanner
-from olx_parser.core import Config, Listing, REASONS, ROOT
+from olx_parser.core import ALL_CATEGORIES, SELLER_CHOICES, Config, Listing, REASONS, ROOT, apply_search_filters
 
 
-def run_cli(config: Config, output: Path | None) -> int:
+def run_cli(config: Config, output: Path | None, manual_login: bool = False) -> int:
     stop = threading.Event()
+    login_ready = threading.Event() if manual_login else None
     sink = None
     try:
         if output:
@@ -29,8 +30,18 @@ def run_cli(config: Config, output: Path | None) -> int:
                 sink.flush()
         import signal
         previous = signal.signal(signal.SIGINT, lambda *_: stop.set())
+        def prompt_login():
+            print("Войдите в OLX в открытом браузере, затем нажмите Enter здесь.", file=sys.stderr, flush=True)
+            try:
+                input()
+            except EOFError:
+                stop.set()
+            else:
+                login_ready.set()
         try:
-            summary = Scanner(config, stop, log=lambda text: print(text, file=sys.stderr), on_result=result).run()
+            summary = Scanner(config, stop, log=lambda text: print(text, file=sys.stderr),
+                              on_result=result, login_ready=login_ready,
+                              on_login_required=prompt_login if manual_login else None).run()
         finally:
             signal.signal(signal.SIGINT, previous)
         print(f"{summary.message} Проверено: {summary.checked}; найдено: {summary.accepted}.", file=sys.stderr)
@@ -50,11 +61,12 @@ def run_gui(config_path: Path, initial_config: Config):
         def __init__(self):
             super().__init__()
             self.title("OLX Portugal — поиск товаров")
-            self.geometry("1000x680")
-            self.minsize(760, 500)
+            self.geometry("1000x780")
+            self.minsize(760, 600)
             self.configure(bg="#15171b")
             self.events = queue.Queue()
             self.stop = threading.Event()
+            self.login_ready = threading.Event()
             self.worker = None
             self.closing = False
             self.results: list[Listing] = []
@@ -67,7 +79,7 @@ def run_gui(config_path: Path, initial_config: Config):
             body = ttk.Frame(self, padding=18)
             body.pack(fill="both", expand=True)
             ttk.Label(body, text="OLX Portugal", font=("Segoe UI", 20, "bold")).pack(anchor="w")
-            ttk.Label(body, text="Публичные признаки проверяются временно. В результатах — только товары и ссылки.").pack(anchor="w", pady=(3, 14))
+            ttk.Label(body, text="Признаки продавца проверяются в браузере. В результатах — только товары и ссылки.").pack(anchor="w", pady=(3, 14))
             controls = ttk.Frame(body)
             controls.pack(fill="x")
             ttk.Label(controls, text="Нужно объявлений:").pack(side="left")
@@ -75,10 +87,43 @@ def run_gui(config_path: Path, initial_config: Config):
             ttk.Entry(controls, textvariable=self.target, width=8).pack(side="left", padx=8)
             self.start_button = ttk.Button(controls, text="Начать поиск", command=self.start)
             self.start_button.pack(side="left", padx=4)
+            self.login_button = ttk.Button(controls, text="Я вошёл — продолжить",
+                                           command=self.continue_after_login, state="disabled")
+            self.login_button.pack(side="left", padx=4)
             self.stop_button = ttk.Button(controls, text="Стоп", command=self.cancel, state="disabled")
             self.stop_button.pack(side="left", padx=4)
             ttk.Button(controls, text="Сохранить результаты…", command=self.save).pack(side="right")
-            self.status = tk.StringVar(value="Категории и фильтры задаются в config.json. Двойной щелчок открывает объявление.")
+            filters = ttk.Frame(body)
+            filters.pack(fill="x", pady=(12, 2))
+
+            period = ttk.Frame(filters)
+            period.pack(fill="x", pady=3)
+            ttk.Label(period, text="Регистрация аккаунта:  с").pack(side="left")
+            self.registered_from = tk.StringVar(value=initial_config.registered_from.isoformat())
+            ttk.Entry(period, textvariable=self.registered_from, width=14).pack(side="left", padx=8)
+            ttk.Label(period, text="по").pack(side="left")
+            self.registered_to = tk.StringVar(value=initial_config.registered_to.isoformat())
+            ttk.Entry(period, textvariable=self.registered_to, width=14).pack(side="left", padx=8)
+            ttk.Label(period, text="ГГГГ-ММ-ДД").pack(side="left")
+
+            category_row = ttk.Frame(filters)
+            category_row.pack(fill="x", pady=3)
+            ttk.Label(category_row, text="Категория:").pack(side="left")
+            self.category = tk.StringVar(value=ALL_CATEGORIES)
+            category_names = [item.name for item in initial_config.categories if item.enabled]
+            ttk.Combobox(category_row, textvariable=self.category,
+                         values=[ALL_CATEGORIES, *category_names], state="readonly", width=37).pack(side="left", padx=8)
+
+            seller_row = ttk.Frame(filters)
+            seller_row.pack(fill="x", pady=3)
+            ttk.Label(seller_row, text="Продавец:").pack(side="left")
+            initial_seller = next((label for label, mode in SELLER_CHOICES.items()
+                                   if mode == initial_config.seller_mode), "Только частные")
+            self.seller_choice = tk.StringVar(value=initial_seller)
+            ttk.Combobox(seller_row, textvariable=self.seller_choice,
+                         values=list(SELLER_CHOICES), state="readonly", width=37).pack(side="left", padx=8)
+
+            self.status = tk.StringVar(value="Категории можно включать в config.json. Двойной щелчок открывает объявление.")
             ttk.Label(body, textvariable=self.status, wraplength=930).pack(fill="x", pady=12)
             self.tree = ttk.Treeview(body, columns=("title", "price", "category"), show="headings", selectmode="browse")
             self.tree.heading("title", text="Товар")
@@ -112,7 +157,11 @@ def run_gui(config_path: Path, initial_config: Config):
                 count = int(self.target.get())
                 if not 1 <= count <= 10000:
                     raise ValueError("Количество должно быть от 1 до 10000.")
-                config = replace(Config.load(config_path), target=count)
+                config = apply_search_filters(
+                    replace(Config.load(config_path), target=count),
+                    self.registered_from.get(), self.registered_to.get(),
+                    self.category.get(), self.seller_choice.get(),
+                )
             except ValueError as exc:
                 messagebox.showerror("Настройки", str(exc), parent=self)
                 return
@@ -120,7 +169,9 @@ def run_gui(config_path: Path, initial_config: Config):
             for item in self.tree.get_children():
                 self.tree.delete(item)
             self.stop.clear()
+            self.login_ready.clear()
             self.start_button.configure(state="disabled")
+            self.login_button.configure(state="disabled")
             self.stop_button.configure(state="normal")
             self.status.set("Запускается браузер…")
             self.append_log("Новый запуск. Настройки прочитаны из config.json.")
@@ -128,7 +179,9 @@ def run_gui(config_path: Path, initial_config: Config):
                 scanner = Scanner(config, self.stop,
                                   log=lambda text: self.events.put(("log", text)),
                                   on_result=lambda item: self.events.put(("result", item)),
-                                  on_progress=lambda checked, accepted: self.events.put(("progress", (checked, accepted))))
+                                  on_progress=lambda checked, accepted: self.events.put(("progress", (checked, accepted))),
+                                  login_ready=self.login_ready,
+                                  on_login_required=lambda: self.events.put(("login", None)))
                 self.events.put(("done", scanner.run()))
             self.worker = threading.Thread(target=work, name="olx-parser", daemon=False)
             self.worker.start()
@@ -136,7 +189,13 @@ def run_gui(config_path: Path, initial_config: Config):
         def cancel(self):
             self.stop.set()
             self.stop_button.configure(state="disabled")
+            self.login_button.configure(state="disabled")
             self.status.set("Останавливается сбор и закрывается браузер…")
+
+        def continue_after_login(self):
+            self.login_ready.set()
+            self.login_button.configure(state="disabled")
+            self.status.set("Поиск объявлений…")
 
         def poll(self):
             try:
@@ -144,6 +203,9 @@ def run_gui(config_path: Path, initial_config: Config):
                     kind, value = self.events.get_nowait()
                     if kind == "log":
                         self.append_log(value)
+                    elif kind == "login":
+                        self.login_button.configure(state="normal")
+                        self.status.set("Войдите в OLX в открытом браузере и нажмите «Я вошёл — продолжить».")
                     elif kind == "result":
                         index = len(self.results)
                         self.results.append(value)
@@ -157,6 +219,7 @@ def run_gui(config_path: Path, initial_config: Config):
                             self.append_log(f"{REASONS[reason]}: {count}")
                         self.start_button.configure(state="normal")
                         self.stop_button.configure(state="disabled")
+                        self.login_button.configure(state="disabled")
             except queue.Empty:
                 pass
             if self.closing and (not self.worker or not self.worker.is_alive()):
@@ -199,6 +262,7 @@ def main() -> int:
     parser.add_argument("--target", type=int, help="Нужное количество объявлений")
     parser.add_argument("--max-ads", type=int, help="Лимит проверяемых объявлений")
     parser.add_argument("--headless", action="store_true", help="Скрытый браузер в консольном режиме")
+    parser.add_argument("--manual-login", action="store_true", help="Остановиться для ручного входа в OLX в консольном режиме")
     parser.add_argument("--output", type=Path, help="Явно сохранить результаты CLI в новый JSONL-файл")
     args = parser.parse_args()
     try:
@@ -206,8 +270,10 @@ def main() -> int:
         if args.check_config:
             print(f"Настройки корректны. Включено категорий: {sum(c.enabled for c in config.categories)}.")
             return 0
-        if not args.cli and (args.output or args.headless or args.max_ads is not None):
-            parser.error("--output, --headless и --max-ads используются вместе с --cli")
+        if not args.cli and (args.output or args.headless or args.max_ads is not None or args.manual_login):
+            parser.error("--output, --headless, --max-ads и --manual-login используются вместе с --cli")
+        if args.manual_login and (args.headless or config.headless):
+            parser.error("--manual-login требует видимый браузер")
         if args.target is not None:
             if not 1 <= args.target <= 10000:
                 parser.error("--target: допустимо 1–10000")
@@ -219,7 +285,7 @@ def main() -> int:
         if args.headless:
             config = replace(config, headless=True)
         if args.cli:
-            return run_cli(config, args.output)
+            return run_cli(config, args.output, args.manual_login)
         run_gui(args.config, config)
         return 0
     except (ValueError, OSError) as exc:
