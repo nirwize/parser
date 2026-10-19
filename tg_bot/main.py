@@ -17,8 +17,7 @@ async def main():
     settings = Settings.load()
     db = Database(settings.database, settings.parser)
     await db.init()
-    # OLX login state lives only in memory; a restarted bot must request login again.
-    await db.execute("UPDATE users SET running=0")
+    await db.execute("UPDATE users SET running=0 WHERE blocked=1")
     bot = Bot(settings.token)
     service = ScanService(db, settings, bot)
     dp = Dispatcher(storage=MemoryStorage())

@@ -3,7 +3,9 @@
 __pycache__/
 *.pyc
 .env
+tg_bot/.env
 results/
 state.json
 tg_bot/*.sqlite3*
+tg_bot/browser_profile/
 

@@ -18,6 +18,7 @@ class Settings:
     admin_id: int
     database: Path
     parser: Config
+    browser_profile: Path
 
     @classmethod
     def load(cls) -> "Settings":
@@ -26,4 +27,5 @@ class Settings:
         admin = os.getenv("ADMIN_ID", "").strip()
         if not token or not admin.isdecimal() or int(admin) <= 0:
             raise ValueError("Укажите BOT_TOKEN и числовой ADMIN_ID в tg_bot/.env")
-        return cls(token, int(admin), HERE / "bot.sqlite3", Config.load())
+        return cls(token, int(admin), HERE / "bot.sqlite3", Config.load(),
+                   HERE / "browser_profile")

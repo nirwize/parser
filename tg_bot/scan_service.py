@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import threading
 from dataclasses import replace
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
@@ -50,13 +52,38 @@ class ScanService:
         self.stop_event = None
         self.login_ready = None
         self.login_waiting = False
-        self.session_state = None
+        self.profile_dir = Path(settings.browser_profile)
+        self.profile_marker = self.profile_dir / ".login-confirmed"
         self.tasks: set[asyncio.Task] = set()
         # Reserve the browser before create_task yields to the event loop.
         self.reservation = None
 
     def busy(self):
         return self.lock.locked() or self.reservation is not None
+
+    def profile_confirmed(self):
+        return self.profile_marker.is_file()
+
+    def profile_available(self):
+        if self.profile_confirmed():
+            return True
+        saved = self.profile_dir / "auth_state.json"
+        try:
+            state = json.loads(saved.read_text(encoding="utf-8"))
+            # Older installations can have a saved browser session but no marker.
+            # Its cookies are only a reason to try the existing profile, not proof
+            # that the user is still authenticated with OLX.
+            return any("olx.pt" in str(cookie.get("domain", ""))
+                       for cookie in state.get("cookies", []) if isinstance(cookie, dict))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
+    def confirm_profile(self):
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self.profile_marker.write_text("confirmed\n", encoding="ascii")
+
+    def require_login(self):
+        self.profile_marker.unlink(missing_ok=True)
 
     def launch(self, user_id, *, notify=True):
         if self.busy():
@@ -155,7 +182,7 @@ class ScanService:
                 self.reservation = None
                 self.current_id = user_id
                 self.stop_event = threading.Event()
-                needs_login = self.session_state is None
+                needs_login = not self.profile_available()
                 if needs_login:
                     self.login_ready = threading.Event()
                 progress = await self.start_progress(user_id)
@@ -188,24 +215,27 @@ class ScanService:
                     loop.call_soon_threadsafe(update)
 
                 items = []
-                states = []
+                login_completed = [False]
                 def on_result(item):
                     items.append(item)
+                def on_login_complete():
+                    login_completed[0] = True
                 try:
                     # A browser on the host PC is shared serially; subscriber preferences stay independent.
                     summary = await asyncio.to_thread(
                         Scanner(config, stop=self.stop_event, on_result=on_result,
-                                on_decision=on_decision, session_state=self.session_state,
+                                on_decision=on_decision, persistent_profile=self.profile_dir,
                                 login_ready=self.login_ready if needs_login else None,
                                 on_login_required=on_login_required if needs_login else None,
-                                on_session_state=states.append).run)
-                    if states:
-                        self.session_state = states[-1]
+                                on_login_complete=on_login_complete).run)
+                    if login_completed[0] and summary.status in {"complete", "incomplete"}:
+                        self.confirm_profile()
                     if worker:
                         await queue.join()
                     await self.db.record_run(user_id, summary)
                     delivered = 0
                     if active(await self.db.user(user_id), self.settings.admin_id):
+                        await self.db.save_listings(user_id, items)
                         for item in items:
                             key = advert_id(item.url)
                             if await self.db.claim_delivery(user_id, key):
@@ -221,7 +251,6 @@ class ScanService:
                     elif notify or summary.status in {"blocked", "error"}:
                         await self.send(user_id, final)
                     if summary.status == "blocked":
-                        self.session_state = None
                         await self.db.set_option("scan_blocked", "1")
                         if user_id != self.settings.admin_id:
                             await self.send(self.settings.admin_id, f"OLX ограничил доступ: {summary.message} Автопроверки приостановлены.")
@@ -263,7 +292,7 @@ class ScanService:
                 self.stop_event = threading.Event()
                 self.login_ready = threading.Event()
                 config = replace(self.settings.parser, target=1, max_ads_per_run=1, headless=False)
-                states = []
+                login_completed = [False]
                 loop = asyncio.get_running_loop()
                 def opened():
                     self.login_waiting = True
@@ -273,12 +302,13 @@ class ScanService:
                 try:
                     summary = await asyncio.to_thread(
                         Scanner(config, stop=self.stop_event, login_ready=self.login_ready,
-                                on_login_required=opened, on_session_state=states.append,
+                                on_login_required=opened, persistent_profile=self.profile_dir,
+                                on_login_complete=lambda: login_completed.__setitem__(0, True),
                                 login_only=True).run)
-                    if states:
-                        self.session_state = states[-1]
+                    if login_completed[0] and summary.status == "complete":
+                        self.confirm_profile()
                         await self.send(self.settings.admin_id,
-                                        "Сессия OLX сохранена только в памяти процесса. После перезапуска бота войдите снова.")
+                                        "Профиль браузера сохранён. При следующих запусках бот откроет его снова; если OLX завершит сеанс, потребуется повторный вход.")
                     if summary.status in {"blocked", "error"}:
                         await self.send(self.settings.admin_id, f"Вход/проверка: {summary.message}")
                 finally:
@@ -300,7 +330,7 @@ class ScanService:
                     interval = int(await self.db.option("interval_minutes") or 15)
                     last = await self.db.one("SELECT finished_at FROM scan_runs WHERE tg_id=? ORDER BY id DESC LIMIT 1", (user["tg_id"],))
                     due = not last or datetime.fromisoformat(last["finished_at"]) + timedelta(minutes=interval) <= now()
-                    if due and self.session_state is not None and await self.db.option("scan_blocked") != "1":
+                    if due and self.profile_available() and await self.db.option("scan_blocked") != "1":
                         if self.launch(user["tg_id"], notify=False):
                             break
                 await asyncio.sleep(15)

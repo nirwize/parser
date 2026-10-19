@@ -1,11 +1,14 @@
 """Synthetic pages only: these tests do not claim OLX's live DOM is verified."""
 import json
+import shutil
+import tempfile
 import threading
 import unittest
 from dataclasses import asdict, replace
+from pathlib import Path
 from unittest.mock import Mock, patch
 
-from olx_parser.browser import AccessBlocked, NavigationError, ReadError, Scanner, launch_browser
+from olx_parser.browser import AccessBlocked, NavigationError, ReadError, Scanner, launch_browser, launch_profile, restore_profile_state, save_profile_state
 from olx_parser.core import Config, evaluate
 
 
@@ -291,6 +294,46 @@ class DefaultBrowserTests(unittest.TestCase):
 
 
 class ScannerIntegrationTests(unittest.TestCase):
+    def test_persistent_profile_restores_session_cookie_after_restart(self):
+        from playwright.sync_api import sync_playwright
+        config = replace(Config.load(), headless=True)
+        with tempfile.TemporaryDirectory() as directory, sync_playwright() as playwright:
+            profile = Path(directory) / "olx-profile"
+            first = launch_profile(playwright, config, profile)
+            first.add_cookies([{"name": "test_session", "value": "signed-in",
+                                "url": "https://www.olx.pt/"}])
+            save_profile_state(first, profile)
+            first.close()
+            second = launch_profile(playwright, config, profile)
+            restore_profile_state(second, profile)
+            cookies = second.cookies("https://www.olx.pt/")
+            second.close()
+        self.assertEqual(next(c["value"] for c in cookies if c["name"] == "test_session"), "signed-in")
+
+    def test_profile_backup_restores_local_storage_to_new_profile(self):
+        from playwright.sync_api import sync_playwright
+        config = replace(Config.load(), headless=True)
+        with tempfile.TemporaryDirectory() as directory, sync_playwright() as playwright:
+            original = Path(directory) / "original"
+            new_profile = Path(directory) / "new"
+            first = launch_profile(playwright, config, original)
+            first.route("**/*", lambda route: route.fulfill(body="<h1>Local test</h1>"))
+            page = first.new_page()
+            page.goto("https://www.olx.pt/")
+            page.evaluate("localStorage.setItem('test_session', 'signed-in')")
+            save_profile_state(first, original)
+            first.close()
+            new_profile.mkdir()
+            shutil.copy2(original / "auth_state.json", new_profile / "auth_state.json")
+            second = launch_profile(playwright, config, new_profile)
+            restore_profile_state(second, new_profile)
+            second.route("**/*", lambda route: route.fulfill(body="<h1>Local test</h1>"))
+            page = second.new_page()
+            page.goto("https://www.olx.pt/")
+            saved = page.evaluate("localStorage.getItem('test_session')")
+            second.close()
+        self.assertEqual(saved, "signed-in")
+
     def test_login_only_captures_session_without_scanning_ads(self):
         config = replace(Config.load(), headless=False, delay_seconds=0, timeout_seconds=2)
         hits, states = [], []

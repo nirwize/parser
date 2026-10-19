@@ -34,6 +34,15 @@ CREATE TABLE IF NOT EXISTS scan_runs (
   status TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS options (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ui_messages (tg_id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS keyboard_messages (tg_id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS keyboard_layouts (tg_id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS saved_listings (
+  tg_id INTEGER NOT NULL, advert_id TEXT NOT NULL, title TEXT NOT NULL,
+  price_eur TEXT NOT NULL, category TEXT NOT NULL, url TEXT NOT NULL,
+  saved_at TEXT NOT NULL, PRIMARY KEY(tg_id, advert_id)
+);
+CREATE INDEX IF NOT EXISTS saved_listings_recent ON saved_listings(tg_id, saved_at DESC);
 """
 
 
@@ -127,6 +136,32 @@ class Database:
     async def unclaim_delivery(self, tg_id, advert_id):
         await self.execute("DELETE FROM deliveries WHERE tg_id=? AND advert_id=?", (tg_id, advert_id))
 
+    async def save_listings(self, tg_id, items):
+        from olx_parser.core import advert_id
+
+        timestamp = iso(now())
+        rows = [(tg_id, advert_id(item.url), item.title, item.price_eur,
+                 item.category, item.url, timestamp) for item in items]
+        if not rows:
+            return
+        async with aiosqlite.connect(self.path) as db:
+            await db.executemany("""INSERT INTO saved_listings
+              (tg_id, advert_id, title, price_eur, category, url, saved_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(tg_id, advert_id) DO UPDATE SET
+                title=excluded.title, price_eur=excluded.price_eur,
+                category=excluded.category, url=excluded.url""", rows)
+            await db.commit()
+
+    async def saved_count(self, tg_id):
+        row = await self.one("SELECT count(*) AS total FROM saved_listings WHERE tg_id=?", (tg_id,))
+        return row["total"]
+
+    async def saved_page(self, tg_id, limit, offset):
+        return await self.all("""SELECT title, price_eur, category, url, saved_at
+          FROM saved_listings WHERE tg_id=? ORDER BY saved_at DESC, advert_id DESC
+          LIMIT ? OFFSET ?""", (tg_id, limit, offset))
+
     async def record_run(self, tg_id, summary):
         await self.execute("INSERT INTO scan_runs (tg_id, finished_at, checked, accepted, status) VALUES (?, ?, ?, ?, ?)",
                            (tg_id, iso(now()), summary.checked, summary.accepted, summary.status))
@@ -137,6 +172,27 @@ class Database:
 
     async def set_option(self, key, value):
         await self.execute("INSERT OR REPLACE INTO options VALUES (?, ?)", (key, str(value)))
+
+    async def ui_message(self, tg_id):
+        row = await self.one("SELECT message_id FROM ui_messages WHERE tg_id=?", (tg_id,))
+        return row["message_id"] if row else None
+
+    async def set_ui_message(self, tg_id, message_id):
+        await self.execute("INSERT OR REPLACE INTO ui_messages VALUES (?, ?)", (tg_id, message_id))
+
+    async def keyboard_message(self, tg_id):
+        row = await self.one("SELECT message_id FROM keyboard_messages WHERE tg_id=?", (tg_id,))
+        return row["message_id"] if row else None
+
+    async def set_keyboard_message(self, tg_id, message_id):
+        await self.execute("INSERT OR REPLACE INTO keyboard_messages VALUES (?, ?)", (tg_id, message_id))
+
+    async def keyboard_layout(self, tg_id):
+        row = await self.one("SELECT version FROM keyboard_layouts WHERE tg_id=?", (tg_id,))
+        return row["version"] if row else None
+
+    async def set_keyboard_layout(self, tg_id, version):
+        await self.execute("INSERT OR REPLACE INTO keyboard_layouts VALUES (?, ?)", (tg_id, version))
 
 
 def active(user, admin_id=None):

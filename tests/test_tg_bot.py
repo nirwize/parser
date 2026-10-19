@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import threading
 import unittest
@@ -9,11 +10,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from aiogram import Router
+from aiogram.types import ReplyKeyboardMarkup
 
 from olx_parser.core import Config, Listing
 from tg_bot.database import Database, active, now
 from tg_bot.filters import parse_duration, validate_date, validate_filters
 from tg_bot.handlers import setup
+from tg_bot.keyboards import MAIN_ACTIONS, main_menu
+from tg_bot.navigation import Navigation
 from tg_bot.scan_service import ScanService, listing_text
 
 
@@ -59,6 +63,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.temp.name) / "test.sqlite3", Config.load())
+        self.settings = SimpleNamespace(parser=Config.load(), admin_id=999,
+                                        browser_profile=Path(self.temp.name) / "profile")
         await self.db.init()
         await self.db.register(42, "example")
 
@@ -101,12 +107,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 return summary
         bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=10)),
                               edit_message_text=AsyncMock())
-        settings = SimpleNamespace(parser=Config.load(), admin_id=999)
-        service = ScanService(self.db, settings, bot)
+        service = ScanService(self.db, self.settings, bot)
         with patch("tg_bot.scan_service.Scanner", FakeScanner):
             await service.run(42)
             await service.run(42)
         self.assertEqual((await self.db.user(42))["found_count"], 1)
+        self.assertEqual(await self.db.saved_count(42), 1)
+        self.assertEqual((await self.db.saved_page(42, 8, 0))[0]["url"], item.url)
         self.assertEqual(bot.send_message.await_count, 3)  # two progress messages, item once
         self.assertGreaterEqual(bot.edit_message_text.await_count, 2)
         self.assertIn("Новых отправлено: 0", bot.edit_message_text.await_args.args[0])
@@ -135,7 +142,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 seen[1].set()
         bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=77)),
                               edit_message_text=AsyncMock(side_effect=edit))
-        service = ScanService(self.db, SimpleNamespace(parser=Config.load(), admin_id=999), bot)
+        service = ScanService(self.db, self.settings, bot)
         with patch("tg_bot.scan_service.Scanner", FakeScanner):
             await service.run(42)
         self.assertEqual(bot.send_message.await_count, 1)
@@ -156,13 +163,12 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 self.kwargs["on_login_required"]()
                 if not self.kwargs["login_ready"].wait(2):
                     raise AssertionError("Ручной вход не подтверждён")
-                self.kwargs["on_session_state"]({"cookies": [{"name": "session"}]})
+                self.kwargs["on_login_complete"]()
                 self.kwargs["on_decision"](1, 0, "price")
                 return summary
         bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=90)),
                               edit_message_text=AsyncMock())
-        settings = SimpleNamespace(parser=Config.load(), admin_id=999)
-        service = ScanService(self.db, settings, bot)
+        service = ScanService(self.db, self.settings, bot)
         with patch("tg_bot.scan_service.Scanner", FakeScanner):
             task = service.launch(42)
             for _ in range(100):
@@ -173,12 +179,23 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(service.login_ready)
             service.login_ready.set()
             await task
-        self.assertIsNone(observed[0]["session_state"])
-        self.assertEqual(service.session_state, {"cookies": [{"name": "session"}]})
+        self.assertEqual(observed[0]["persistent_profile"], self.settings.browser_profile)
+        self.assertTrue(service.profile_confirmed())
+        restarted = ScanService(self.db, self.settings, bot)
+        self.assertTrue(restarted.profile_confirmed())
+        class ReopenedScanner:
+            def __init__(self, config, **kwargs):
+                self.kwargs = kwargs
+            def run(self):
+                observed.append(self.kwargs)
+                return summary
+        with patch("tg_bot.scan_service.Scanner", ReopenedScanner):
+            await restarted.run(42)
+        self.assertIsNone(observed[1]["login_ready"])
         self.assertEqual(await self.db.option("scan_blocked"), "0")
         self.assertFalse(service.login_waiting)
 
-    async def test_blocked_scan_drops_stale_session_and_pauses_auto(self):
+    async def test_blocked_scan_keeps_profile_and_pauses_auto(self):
         await self.db.grant(42, 86400)
         summary = SimpleNamespace(checked=4, accepted=0, status="blocked", message="HTTP 403")
         class FakeScanner:
@@ -188,13 +205,36 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 return summary
         bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=91)),
                               edit_message_text=AsyncMock())
-        settings = SimpleNamespace(parser=Config.load(), admin_id=999)
-        service = ScanService(self.db, settings, bot)
-        service.session_state = {"cookies": [{"name": "old"}]}
+        service = ScanService(self.db, self.settings, bot)
+        service.confirm_profile()
         with patch("tg_bot.scan_service.Scanner", FakeScanner):
             await service.run(42)
-        self.assertIsNone(service.session_state)
+        self.assertTrue(service.profile_confirmed())
         self.assertEqual(await self.db.option("scan_blocked"), "1")
+
+    async def test_saved_browser_state_does_not_force_another_login(self):
+        await self.db.grant(42, 86400)
+        self.settings.browser_profile.mkdir()
+        (self.settings.browser_profile / "auth_state.json").write_text(json.dumps({
+            "cookies": [{"name": "session", "domain": ".olx.pt", "value": "test"}]
+        }), encoding="utf-8")
+        observed = []
+        summary = SimpleNamespace(checked=1, accepted=0, status="complete", message="Готово")
+        class FakeScanner:
+            def __init__(self, config, **kwargs):
+                observed.append(kwargs)
+            def run(self):
+                return summary
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=92)),
+                              edit_message_text=AsyncMock())
+        service = ScanService(self.db, self.settings, bot)
+        self.assertFalse(service.profile_confirmed())
+        self.assertTrue(service.profile_available())
+        with patch("tg_bot.scan_service.Scanner", FakeScanner):
+            await service.run(42)
+        self.assertIsNone(observed[0]["login_ready"])
+        self.assertIsNone(observed[0]["on_login_required"])
+        self.assertEqual(bot.send_message.await_count, 1)
 
     async def test_first_scan_reserves_browser_before_scheduler_can_launch(self):
         await self.db.grant(42, 86400)
@@ -209,7 +249,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 return summary
         bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=55)),
                               edit_message_text=AsyncMock())
-        service = ScanService(self.db, SimpleNamespace(parser=Config.load(), admin_id=999), bot)
+        service = ScanService(self.db, self.settings, bot)
         with patch("tg_bot.scan_service.Scanner", FakeScanner):
             first = service.launch(42)
             self.assertIsNotNone(first)
@@ -225,9 +265,101 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("занят" in str(call) for call in bot.send_message.await_args_list))
 
     async def test_router_builds_with_installed_aiogram(self):
-        service = SimpleNamespace()
+        service = SimpleNamespace(bot=SimpleNamespace())
         router = setup(self.db, SimpleNamespace(admin_id=999, parser=Config.load()), service)
         self.assertIsInstance(router, Router)
+
+    async def test_main_keyboard_and_screen_switch(self):
+        keyboard = main_menu()
+        self.assertIsInstance(keyboard, ReplyKeyboardMarkup)
+        self.assertTrue(keyboard.is_persistent)
+        self.assertEqual(len([button for row in keyboard.keyboard for button in row]), 7)
+        self.assertEqual(len([button for row in main_menu(True).keyboard for button in row]), 8)
+        self.assertEqual(MAIN_ACTIONS["📊 Статистика"], "stats")
+        self.assertEqual(MAIN_ACTIONS["📌 Сохранённые объявления"], "saved")
+
+        next_id = 100
+        async def send(chat_id, text, **kwargs):
+            nonlocal next_id
+            next_id += 1
+            return SimpleNamespace(message_id=next_id)
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=send), delete_message=AsyncMock())
+        service = SimpleNamespace(bot=bot)
+        router = setup(self.db, self.settings, service)
+        button = next(handler.callback for handler in router.message.handlers
+                      if handler.callback.__name__ == "main_button")
+        state = SimpleNamespace(clear=AsyncMock())
+        sender = SimpleNamespace(id=42)
+        await self.db.grant(42, 86400)
+        await button(SimpleNamespace(text="📊 Статистика", from_user=sender, message_id=90), state)
+        await button(SimpleNamespace(text="👤 Мой профиль", from_user=sender, message_id=91), state)
+        self.assertEqual(await self.db.keyboard_message(42), 101)
+        self.assertEqual(await self.db.ui_message(42), 103)
+        self.assertEqual([call.kwargs["message_id"] for call in bot.delete_message.await_args_list],
+                         [90, 91, 102])
+        self.assertIsInstance(bot.send_message.await_args_list[0].kwargs["reply_markup"], ReplyKeyboardMarkup)
+        self.assertIn("Проверок:", bot.send_message.await_args_list[1].args[1])
+        self.assertIn("Статус:", bot.send_message.await_args_list[2].args[1])
+        self.assertEqual(state.clear.await_count, 2)
+
+    async def test_saved_listings_are_private_linked_and_paginated(self):
+        await self.db.grant(42, 86400)
+        items = [Listing(f"Товар <{index}>", "10.00", "Электроника",
+                         f"https://www.olx.pt/d/anuncio/test-ID{index:04d}.html")
+                 for index in range(9)]
+        await self.db.save_listings(42, items)
+        await self.db.save_listings(42, items[:1])
+        self.assertEqual(await self.db.saved_count(42), 9)
+        self.assertEqual(await self.db.saved_count(43), 0)
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=33)),
+                              delete_message=AsyncMock())
+        router = setup(self.db, self.settings, SimpleNamespace(bot=bot))
+        button = next(handler.callback for handler in router.message.handlers
+                      if handler.callback.__name__ == "main_button")
+        await button(SimpleNamespace(text="📌 Сохранённые объявления",
+                                     from_user=SimpleNamespace(id=42), message_id=91),
+                     SimpleNamespace(clear=AsyncMock()))
+        page = bot.send_message.await_args_list[-1]
+        self.assertIn('href="https://www.olx.pt/d/anuncio/', page.args[1])
+        self.assertIn("&lt;", page.args[1])
+        self.assertEqual(len(page.kwargs["reply_markup"].inline_keyboard), 1)
+        self.assertEqual(page.kwargs["reply_markup"].inline_keyboard[0][0].callback_data, "saved:1")
+
+    async def test_keyboard_layout_upgrade_replaces_old_anchor(self):
+        await self.db.set_keyboard_message(42, 10)
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=11)),
+                              delete_message=AsyncMock())
+        await Navigation(self.db, bot).ensure_keyboard(42, main_menu())
+        bot.delete_message.assert_awaited_once_with(chat_id=42, message_id=10)
+        self.assertEqual(await self.db.keyboard_message(42), 11)
+        self.assertEqual(await self.db.keyboard_layout(42), Navigation.KEYBOARD_VERSION)
+
+    async def test_login_confirmation_removes_prompt(self):
+        ready = threading.Event()
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=20)),
+                              delete_message=AsyncMock())
+        service = SimpleNamespace(bot=bot, login_ready=ready, login_waiting=True)
+        router = setup(self.db, self.settings, service)
+        action = next(handler.callback for handler in router.callback_query.handlers
+                      if handler.callback.__name__ == "admin_action")
+        query = SimpleNamespace(from_user=SimpleNamespace(id=999), data="admin:ready",
+                                message=SimpleNamespace(text="Войдите вручную в OLX", message_id=18),
+                                answer=AsyncMock())
+        await self.db.register(999, "owner")
+        await action(query, SimpleNamespace())
+        self.assertTrue(ready.is_set())
+        bot.delete_message.assert_awaited_once_with(chat_id=999, message_id=18)
+
+    async def test_navigation_only_deletes_its_own_message(self):
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=[
+            SimpleNamespace(message_id=1), SimpleNamespace(message_id=3),
+        ]), delete_message=AsyncMock())
+        nav = Navigation(self.db, bot)
+        await nav.show(42, "Меню", reply_markup=main_menu())
+        # Message 2 could be scan progress: it is never stored as a navigation screen.
+        await nav.show(42, "Фильтры")
+        bot.delete_message.assert_awaited_once_with(chat_id=42, message_id=1)
+        self.assertEqual(await self.db.ui_message(42), 3)
 
 
 if __name__ == "__main__":

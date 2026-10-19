@@ -1,4 +1,16 @@
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+
+
+MAIN_ACTIONS = {
+    "▶️ Запустить парсер": "scan:start",
+    "⏹ Остановить": "scan:stop",
+    "🔎 Проверить новые": "scan:once",
+    "⚙️ Фильтры": "filters",
+    "📊 Статистика": "stats",
+    "👤 Мой профиль": "profile",
+    "📌 Сохранённые объявления": "saved",
+    "🛡 Админ-панель": "admin",
+}
 
 
 def kb(*rows):
@@ -9,14 +21,15 @@ def kb(*rows):
 
 
 def main_menu(admin=False):
-    rows = [
-        [("▶️ Запустить парсер", "scan:start"), ("⏹ Остановить", "scan:stop")],
-        [("🔎 Проверить новые", "scan:once"), ("⚙️ Фильтры", "filters")],
-        [("📊 Статистика", "stats"), ("👤 Мой профиль", "profile")],
-    ]
-    if admin:
-        rows.append([("🛡 Админ-панель", "admin")])
-    return kb(*rows)
+    labels = list(MAIN_ACTIONS)
+    if not admin:
+        labels.remove("🛡 Админ-панель")
+    rows = [labels[index:index + 2] for index in range(0, len(labels), 2)]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=label) for label in row] for row in rows],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def filter_menu():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sys
 import threading
@@ -115,7 +116,7 @@ def default_browser_executable() -> str | None:
     return buffer.value or None
 
 
-def launch_browser(playwright, config: Config):
+def browser_options(playwright, config: Config):
     options = {"headless": config.headless}
     browser_type = playwright.chromium
     if config.browser_channel == "auto":
@@ -137,6 +138,11 @@ def launch_browser(playwright, config: Config):
             raise ScanError(f"Браузер Windows по умолчанию ({name}) не поддерживается Playwright.")
     elif config.browser_channel != "chromium":
         options["channel"] = config.browser_channel
+    return browser_type, options
+
+
+def launch_browser(playwright, config: Config):
+    browser_type, options = browser_options(playwright, config)
     try:
         # No stealth arguments, proxy rotation or access-control workarounds.
         return browser_type.launch(**options)
@@ -146,12 +152,72 @@ def launch_browser(playwright, config: Config):
         raise ScanError("Браузер по умолчанию не запустился через Playwright. Проверьте его установку или выберите browser_channel в config.json.") from None
 
 
+def launch_profile(playwright, config: Config, profile_dir: Path):
+    browser_type, options = browser_options(playwright, config)
+    options.update(user_data_dir=str(profile_dir), locale="pt-PT",
+                   viewport={"width": 1400, "height": 900})
+    try:
+        return browser_type.launch_persistent_context(**options)
+    except Exception:
+        raise ScanError("Не удалось открыть профиль браузера бота. Закройте другое окно с этим профилем или проверьте установку браузера Playwright.") from None
+
+
+def restore_profile_state(context, profile_dir: Path):
+    """Restore session cookies that Chromium may discard when a window closes."""
+    from playwright.sync_api import Error as PlaywrightError
+    saved = profile_dir / "auth_state.json"
+    if not saved.is_file():
+        return False
+    try:
+        state = json.loads(saved.read_text(encoding="utf-8"))
+        cookies = state.get("cookies", [])
+        if not isinstance(cookies, list):
+            raise ValueError("invalid cookies")
+        if cookies:
+            context.add_cookies(cookies)
+        origins = {}
+        for origin in state.get("origins", []):
+            if not isinstance(origin, dict) or not isinstance(origin.get("origin"), str):
+                continue
+            host = urlsplit(origin["origin"]).hostname or ""
+            if host != "olx.pt" and not host.endswith(".olx.pt"):
+                continue
+            values = {item["name"]: item["value"] for item in origin.get("localStorage", [])
+                      if isinstance(item, dict) and isinstance(item.get("name"), str)
+                      and isinstance(item.get("value"), str)}
+            if values:
+                origins[origin["origin"]] = values
+        if origins:
+            # Fill missing keys before the site's scripts run; do not overwrite newer values.
+            context.add_init_script("""(() => {
+                const saved = %s[location.origin];
+                if (!saved) return;
+                for (const [key, value] of Object.entries(saved)) {
+                    if (localStorage.getItem(key) === null) localStorage.setItem(key, value);
+                }
+            })();""" % json.dumps(origins, ensure_ascii=False))
+        return True
+    except (OSError, ValueError, TypeError, PlaywrightError):
+        # Keep the browser usable; a successful run will replace a bad snapshot.
+        return False
+
+
+def save_profile_state(context, profile_dir: Path):
+    """Keep Playwright storage state inside the ignored, private browser profile."""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    target = profile_dir / "auth_state.json"
+    temporary = profile_dir / "auth_state.tmp"
+    temporary.write_text(json.dumps(context.storage_state(), ensure_ascii=False), encoding="utf-8")
+    temporary.replace(target)
+
+
 class Scanner:
     def __init__(self, config: Config, stop: threading.Event | None = None,
                  log=None, on_result=None, on_progress=None,
                  login_ready: threading.Event | None = None, on_login_required=None,
                  session_state: dict | None = None, on_session_state=None,
-                 on_decision=None, login_only: bool = False):
+                 on_decision=None, login_only: bool = False,
+                 persistent_profile: Path | None = None, on_login_complete=None):
         self.config = config
         self.stop = stop if stop is not None else threading.Event()
         self.log = log or (lambda message: None)
@@ -163,6 +229,8 @@ class Scanner:
         self.session_state = session_state
         self.on_session_state = on_session_state or (lambda state: None)
         self.login_only = login_only
+        self.persistent_profile = persistent_profile
+        self.on_login_complete = on_login_complete or (lambda: None)
         self._last_navigation = 0.0
 
     def pause(self, seconds: float = 0) -> None:
@@ -261,7 +329,7 @@ class Scanner:
         return False
 
     def extract(self, page) -> dict:
-        # No screenshots, HTML dumps, HAR, storage_state, profiles or phone strings.
+        # Advertisement evidence never includes screenshots, HTML dumps or phone strings.
         return page.evaluate(EXTRACT_JS, {
             "selectors": self.config.selectors,
             "offerPatterns": list(self.config.excluded_offer_patterns),
@@ -379,12 +447,15 @@ class Scanner:
             with sync_playwright() as p:
                 try:
                     self.pause()
-                    browser = launch_browser(p, self.config)
-                    # The bot may reuse a manual login in memory; it is never written to disk.
-                    context_options = {"locale": "pt-PT", "viewport": {"width": 1400, "height": 900}}
-                    if self.session_state is not None:
-                        context_options["storage_state"] = self.session_state
-                    context = browser.new_context(**context_options)
+                    if self.persistent_profile is not None:
+                        context = launch_profile(p, self.config, self.persistent_profile)
+                        restore_profile_state(context, self.persistent_profile)
+                    else:
+                        browser = launch_browser(p, self.config)
+                        context_options = {"locale": "pt-PT", "viewport": {"width": 1400, "height": 900}}
+                        if self.session_state is not None:
+                            context_options["storage_state"] = self.session_state
+                        context = browser.new_context(**context_options)
                     context.set_default_timeout(self.config.timeout_seconds * 1000)
                     listing_page = context.new_page()
                     if self.login_ready is not None:
@@ -396,7 +467,9 @@ class Scanner:
                         while not self.login_ready.wait(0.2):
                             self.pause()
                         self.check_access(listing_page)
-                        self.on_session_state(context.storage_state())
+                        if self.persistent_profile is None:
+                            self.on_session_state(context.storage_state())
+                        self.on_login_complete()
                         if self.login_only:
                             summary.message = "Сессия браузера получена. Доступность объявлений проверится при запуске парсера."
                             return summary
@@ -495,9 +568,17 @@ class Scanner:
                     # Close before leaving Playwright, including on cancellation or access failure.
                     if context is not None:
                         try:
+                            if self.persistent_profile is not None:
+                                save_profile_state(context, self.persistent_profile)
                             context.close()
-                        except PlaywrightError:
-                            pass
+                        except (PlaywrightError, OSError):
+                            try:
+                                context.close()
+                            except PlaywrightError:
+                                pass
+                            if summary.status == "complete":
+                                summary.status = "error"
+                                summary.message = "Не удалось сохранить сессию браузера для следующего запуска."
                     if browser is not None:
                         try:
                             browser.close()
