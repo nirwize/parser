@@ -149,14 +149,20 @@ def launch_browser(playwright, config: Config):
 class Scanner:
     def __init__(self, config: Config, stop: threading.Event | None = None,
                  log=None, on_result=None, on_progress=None,
-                 login_ready: threading.Event | None = None, on_login_required=None):
+                 login_ready: threading.Event | None = None, on_login_required=None,
+                 session_state: dict | None = None, on_session_state=None,
+                 on_decision=None, login_only: bool = False):
         self.config = config
         self.stop = stop if stop is not None else threading.Event()
         self.log = log or (lambda message: None)
         self.on_result = on_result or (lambda result: None)
         self.on_progress = on_progress or (lambda checked, accepted: None)
+        self.on_decision = on_decision or (lambda checked, accepted, reason: None)
         self.login_ready = login_ready
         self.on_login_required = on_login_required or (lambda: None)
+        self.session_state = session_state
+        self.on_session_state = on_session_state or (lambda state: None)
+        self.login_only = login_only
         self._last_navigation = 0.0
 
     def pause(self, seconds: float = 0) -> None:
@@ -374,8 +380,11 @@ class Scanner:
                 try:
                     self.pause()
                     browser = launch_browser(p, self.config)
-                    # A fresh, nonpersistent context: authentication is not read or saved.
-                    context = browser.new_context(locale="pt-PT", viewport={"width": 1400, "height": 900})
+                    # The bot may reuse a manual login in memory; it is never written to disk.
+                    context_options = {"locale": "pt-PT", "viewport": {"width": 1400, "height": 900}}
+                    if self.session_state is not None:
+                        context_options["storage_state"] = self.session_state
+                    context = browser.new_context(**context_options)
                     context.set_default_timeout(self.config.timeout_seconds * 1000)
                     listing_page = context.new_page()
                     if self.login_ready is not None:
@@ -387,6 +396,10 @@ class Scanner:
                         while not self.login_ready.wait(0.2):
                             self.pause()
                         self.check_access(listing_page)
+                        self.on_session_state(context.storage_state())
+                        if self.login_only:
+                            summary.message = "Сессия браузера получена. Доступность объявлений проверится при запуске парсера."
+                            return summary
                     seen_ads = set()
                     for category in self.config.categories:
                         if not category.enabled:
@@ -465,6 +478,7 @@ class Scanner:
                                 else:
                                     self.log(f"Объявление #{summary.checked} ({key}): пропуск — {REASONS[reason]}.")
                                 self.on_progress(summary.checked, summary.accepted)
+                                self.on_decision(summary.checked, summary.accepted, reason)
                             if summary.accepted >= self.config.target or summary.checked >= self.config.max_ads_per_run:
                                 break
                             next_url = self.next_page(listing_page, category)

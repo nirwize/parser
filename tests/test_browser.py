@@ -291,6 +291,29 @@ class DefaultBrowserTests(unittest.TestCase):
 
 
 class ScannerIntegrationTests(unittest.TestCase):
+    def test_login_only_captures_session_without_scanning_ads(self):
+        config = replace(Config.load(), headless=False, delay_seconds=0, timeout_seconds=2)
+        hits, states = [], []
+        ready = threading.Event()
+        def setup_browser(p, c):
+            real = launch_browser(p, replace(c, headless=True))
+            class Wrapper:
+                def new_context(self, **options):
+                    ctx = real.new_context(**options)
+                    ctx.route("**/*", lambda route: (hits.append(route.request.url),
+                                                       route.fulfill(body="<h1>OLX</h1>")))
+                    return ctx
+                def close(self):
+                    real.close()
+            return Wrapper()
+        with patch("olx_parser.browser.launch_browser", setup_browser):
+            summary = Scanner(config, login_ready=ready, on_login_required=ready.set,
+                              on_session_state=states.append, login_only=True).run()
+        self.assertEqual(summary.status, "complete", summary.message)
+        self.assertEqual(summary.checked, 0)
+        self.assertEqual(hits, ["https://www.olx.pt/"])
+        self.assertEqual(len(states), 1)
+
     def test_full_run_paginates_deduplicates_and_closes_context(self):
         # Browser routing serves a fake OLX site without contacting the internet.
         config = Config.load()

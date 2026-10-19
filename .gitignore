@@ -1,7 +1,9 @@
 .venv/
+.venv_bot/
 __pycache__/
 *.pyc
 .env
 results/
 state.json
+tg_bot/*.sqlite3*
 
